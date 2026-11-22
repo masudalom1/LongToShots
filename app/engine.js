@@ -1,10 +1,17 @@
 /*
-- LongToShorts client-side engine (longtoshorts.in).
-- Everything here runs in the browser: no backend, no paid APIs.
-- Highlight detection: Web Audio decode + loudness/speech-activity scoring
-- Captions: open-source Whisper via transformers.js, running locally in a Web Worker
-- Rendering: Canvas (crop / blur-fit / burned-in captions) + MediaRecorder (MP4 where supported)
-- Storage: IndexedDB (projects + source videos stay on this device)
+ * LongToShorts client-side engine (longtoshorts.in).
+ * Everything here runs in the browser: no backend, no paid APIs.
+ * - Highlight detection: Web Audio decode + loudness/speech-activity scoring
+ * - Captions: open-source Whisper via transformers.js, running locally in a Web Worker
+ * - Rendering: Canvas (crop / blur-fit / burned-in captions) + MediaRecorder (MP4 where supported)
+ * - Storage: IndexedDB (projects + source videos stay on this device)
+ *
+ * HINDI / INDIC FIXES in this version:
+ *  1. Devanagari font is now actually loaded (Google Fonts) and awaited before preview/export.
+ *  2. titleFromText() no longer strips Devanagari vowel signs (matras) -> titles were garbled.
+ *  3. Caption line-height is taller for Indic scripts so matras don't clip / overlap.
+ *  4. Worker: explicit language + task, repetition guard, and a safer fallback chain.
+ *  5. Whisper Small is recommended / auto-selected for Hindi (Base/Tiny are very inaccurate for Hindi).
  */
 
 export const SR = 16000; // Whisper expects 16 kHz mono
@@ -20,6 +27,11 @@ export const ASPECTS = {
   "16:9": { label: "16:9", sub: "YouTube", w: 16, h: 9 },
 };
 
+const FONT_HEAVY =
+  '"Arial Black", "Noto Sans Devanagari", "Nirmala UI", "Mangal", "Kohinoor Devanagari", Arial, sans-serif';
+const FONT_NORMAL =
+  'Arial, "Noto Sans Devanagari", "Nirmala UI", "Mangal", "Kohinoor Devanagari", Helvetica, sans-serif';
+
 export const CAPTION_STYLES = {
   bold: {
     label: "Bold",
@@ -27,7 +39,7 @@ export const CAPTION_STYLES = {
     stroke: "#000000",
     upper: true,
     weight: 900,
-    font: '"Arial Black", "Noto Sans Devanagari", "Nirmala UI", Arial, sans-serif',
+    font: FONT_HEAVY,
   },
   yellow: {
     label: "Yellow Pop",
@@ -35,7 +47,7 @@ export const CAPTION_STYLES = {
     stroke: "#000000",
     upper: true,
     weight: 900,
-    font: '"Arial Black", "Noto Sans Devanagari", "Nirmala UI", Arial, sans-serif',
+    font: FONT_HEAVY,
   },
   boxed: {
     label: "Boxed",
@@ -43,7 +55,7 @@ export const CAPTION_STYLES = {
     box: "rgba(0,0,0,0.72)",
     upper: false,
     weight: 700,
-    font: 'Arial, "Noto Sans Devanagari", "Nirmala UI", Helvetica, sans-serif',
+    font: FONT_NORMAL,
   },
   violet: {
     label: "Violet",
@@ -51,17 +63,19 @@ export const CAPTION_STYLES = {
     box: "#7c3aed",
     upper: true,
     weight: 900,
-    font: '"Arial Black", "Noto Sans Devanagari", "Nirmala UI", Arial, sans-serif',
+    font: FONT_HEAVY,
   },
 };
 
 export const MODELS = [
-  { id: "Xenova/whisper-base", label: "Whisper Base · Multilingual (Hindi + 99) · balanced", multilingual: true },
-  { id: "Xenova/whisper-tiny", label: "Whisper Tiny · Multilingual · fast", multilingual: true },
-  { id: "Xenova/whisper-small", label: "Whisper Small · Multilingual · best (large download)", multilingual: true },
+  { id: "Xenova/whisper-base", label: "Whisper Base · Multilingual · balanced (weak for Hindi)", multilingual: true },
+  { id: "Xenova/whisper-tiny", label: "Whisper Tiny · Multilingual · fast (weak for Hindi)", multilingual: true },
+  { id: "Xenova/whisper-small", label: "Whisper Small · Multilingual · BEST for Hindi (large download)", multilingual: true },
   { id: "Xenova/whisper-tiny.en", label: "Whisper Tiny · English only · fastest", multilingual: false },
   { id: "Xenova/whisper-base.en", label: "Whisper Base · English only · accurate", multilingual: false },
 ];
+
+export const HINDI_MODEL = "Xenova/whisper-small";
 
 export const LANGUAGES = [
   ["auto", "Auto-detect"],
@@ -83,6 +97,20 @@ export const LANGUAGES = [
   ["arabic", "Arabic"],
   ["indonesian", "Indonesian"],
   ["japanese", "Japanese"],
+];
+
+/** Languages where Whisper Tiny/Base are unreliable and Small is strongly recommended. */
+export const INDIC_LANGUAGES = [
+  "hindi",
+  "bengali",
+  "urdu",
+  "tamil",
+  "telugu",
+  "marathi",
+  "gujarati",
+  "punjabi",
+  "kannada",
+  "malayalam",
 ];
 
 export const DEFAULT_SETTINGS = {
@@ -230,6 +258,49 @@ export function pickMime() {
   return candidates.find((m) => MediaRecorder.isTypeSupported(m)) || null;
 }
 
+/* ------------------------------- fonts ------------------------------- */
+
+let fontsPromise = null;
+
+/**
+ * Canvas can't trigger lazy web-font loading, so Devanagari text would silently
+ * render with whatever fallback the device has (or as empty boxes). We load
+ * Noto Sans Devanagari explicitly and wait for it before drawing / exporting.
+ */
+export function ensureCaptionFonts() {
+  if (typeof document === "undefined") return Promise.resolve();
+  if (fontsPromise) return fontsPromise;
+  fontsPromise = new Promise((resolve) => {
+    const sample = "हिन्दी कैप्शन";
+    const loadFaces = () =>
+      Promise.all(
+        ["400", "700", "900"].map((w) =>
+          document.fonts.load(`${w} 40px "Noto Sans Devanagari"`, sample)
+        )
+      ).then(
+        () => resolve(),
+        () => resolve()
+      );
+    const existing = document.getElementById("lts-indic-fonts");
+    if (existing) {
+      loadFaces();
+    } else {
+      const l = document.createElement("link");
+      l.id = "lts-indic-fonts";
+      l.rel = "stylesheet";
+      l.href =
+        "https://fonts.googleapis.com/css2?family=Noto+Sans+Devanagari:wght@400;700;900&display=swap";
+      l.onload = loadFaces;
+      l.onerror = () => resolve(); // offline: fall back to system fonts
+      document.head.appendChild(l);
+    }
+    setTimeout(resolve, 7000); // never block rendering forever
+  });
+  return fontsPromise;
+}
+
+const INDIC_RE = /[\u0900-\u0DFF\u0600-\u06FF]/;
+
 /* ------------------------------- drawing ------------------------------- */
 
 function drawCover(ctx, video, W, H, fx = 0.5, fy = 0.5) {
@@ -274,15 +345,17 @@ function wrapText(ctx, text, maxW) {
 
 export function drawCaption(ctx, text, W, H, o = {}) {
   const st = CAPTION_STYLES[o.captionStyle] || CAPTION_STYLES.bold;
+  const indic = INDIC_RE.test(text);
   const fs = Math.round(Math.min(W, H) * 0.072 * (o.captionSize || 1));
-  const t = st.upper ? text.toUpperCase() : text;
+  const t = st.upper && !indic ? text.toUpperCase() : text;
   ctx.save();
   ctx.font = `${st.weight} ${fs}px ${st.font}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.lineJoin = "round";
   const lines = wrapText(ctx, t, W * 0.84);
-  const lh = fs * 1.22;
+  // Devanagari has tall matras above and below the line: needs more leading
+  const lh = fs * (indic ? 1.5 : 1.22);
   const top = H * (o.captionPos ?? 0.72) - ((lines.length - 1) * lh) / 2;
   lines.forEach((ln, i) => {
     const y = top + i * lh;
@@ -293,7 +366,7 @@ export function drawCaption(ctx, text, W, H, o = {}) {
       ctx.fill();
     }
     if (st.stroke) {
-      ctx.lineWidth = fs * 0.2;
+      ctx.lineWidth = fs * (indic ? 0.14 : 0.2); // thinner stroke keeps small matras readable
       ctx.strokeStyle = st.stroke;
       ctx.strokeText(ln, W / 2, y);
     }
@@ -409,9 +482,9 @@ export function downsampleEnergy(energy, buckets = 320) {
 }
 
 /**
-- Scores every window of `clipLen` seconds by loudness, speech activity and
-- dynamics, then greedily picks the best non-overlapping windows.
-- maxCount = Infinity → as many clips as the video allows.
+ * Scores every window of `clipLen` seconds by loudness, speech activity and
+ * dynamics, then greedily picks the best non-overlapping windows.
+ * maxCount = Infinity → as many clips as the video allows.
  */
 export function findHighlights(energy, duration, clipLen, maxCount) {
   if (duration <= clipLen + 0.5) return [{ start: 0, end: +duration.toFixed(2), score: 1 }];
@@ -519,12 +592,28 @@ function load(model) {
 }
 
 function run(p, audio, model, language, words) {
-  const opts = { return_timestamps: words ? "word" : true, chunk_length_s: 30, stride_length_s: 5 };
+  const opts = {
+    return_timestamps: words ? "word" : true,
+    chunk_length_s: 30,
+    stride_length_s: 5,
+    // Small multilingual models (esp. on Hindi) love to loop the same phrase forever
+    no_repeat_ngram_size: 4,
+    repetition_penalty: 1.1,
+  };
   if (!model.endsWith(".en")) {
-    opts.task = "transcribe";
+    opts.task = "transcribe"; // keep the original language (never translate to English)
     if (language) opts.language = language;
   }
   return p(audio, opts);
+}
+
+// A transcript is "usable" if it has text and not just a handful of repeated tokens
+function usable(out) {
+  const text = ((out && out.text) || "").trim();
+  if (!text) return false;
+  const toks = text.split(/\\s+/);
+  if (toks.length >= 8 && new Set(toks).size / toks.length < 0.15) return false;
+  return true;
 }
 
 self.onmessage = async (e) => {
@@ -532,12 +621,21 @@ self.onmessage = async (e) => {
   currentId = id;
   try {
     const p = await load(model);
-    let out;
+    let out = null;
     try {
       out = await run(p, audio, model, language, true);
       if (!out.chunks || !out.chunks.length) throw new Error("no word timestamps");
     } catch (err) {
-      out = await run(p, audio, model, language, false); // fallback: segment timestamps
+      out = null;
+    }
+    if (!out || !usable(out)) {
+      // fallback: segment-level timestamps (more robust for Indic scripts)
+      try {
+        const seg = await run(p, audio, model, language, false);
+        if (!out || usable(seg)) out = seg;
+      } catch (err) {
+        if (!out) throw err;
+      }
     }
     self.postMessage({ id, type: "result", data: { text: out.text || "", chunks: out.chunks || [] } });
   } catch (err) {
@@ -617,7 +715,7 @@ export function buildCaptions(chunks, offset, clipDur, maxWords = 4) {
       const t = c.text.trim();
       if (g.length && a - g[g.length - 1].b > 0.8) flush();
       g.push({ a, b, t });
-      if (g.length >= maxWords || /[.!?,;।]$/.test(t)) flush();
+      if (g.length >= maxWords || /[.!?,;।॥]$/.test(t)) flush();
     }
     flush();
     // close tiny gaps so captions don't flicker
@@ -647,9 +745,13 @@ export function buildCaptions(chunks, offset, clipDur, maxWords = 4) {
   return out;
 }
 
+/**
+ * FIX: \p{M} (combining marks) is required, otherwise Devanagari vowel signs
+ * (matras like ा ि ी ु ू े ै ो ौ ं ः ्) are replaced by spaces and Hindi words get shredded.
+ */
 export function titleFromText(text, fallback) {
   const words = (text || "")
-    .replace(/[^\p{L}\p{N}\s']/gu, " ")
+    .replace(/[^\p{L}\p{M}\p{N}\s']/gu, " ")
     .split(/\s+/)
     .filter(Boolean)
     .slice(0, 6);
@@ -661,12 +763,13 @@ export function titleFromText(text, fallback) {
 /* ------------------------------- export ------------------------------- */
 
 /**
-- Renders a clip in real time through a canvas and records it with MediaRecorder.
-- Output: MP4 (H.264/AAC) in Chrome, Edge & Safari; WebM in Firefox. No watermark.
+ * Renders a clip in real time through a canvas and records it with MediaRecorder.
+ * Output: MP4 (H.264/AAC) in Chrome, Edge & Safari; WebM in Firefox. No watermark.
  */
 export async function renderClip({ src, clip, settings, onProgress, signal }) {
   const mime = pickMime();
   if (!mime) throw new Error("This browser cannot record video (MediaRecorder unsupported)");
+  await ensureCaptionFonts(); // make sure Hindi glyphs are ready before the first frame
   const { W, H } = getDims(settings.aspect, settings.quality);
   const canvas = document.createElement("canvas");
   canvas.width = W;

@@ -53,6 +53,8 @@ import {
     CAPTION_STYLES,
     MODELS,
     LANGUAGES,
+    INDIC_LANGUAGES,
+    HINDI_MODEL,
     DEFAULT_SETTINGS,
     uid,
     clamp,
@@ -65,6 +67,7 @@ import {
     probeVideo,
     getDims,
     pickMime,
+    ensureCaptionFonts,
     drawFrame,
     captionAt,
     decodeMonoAudio,
@@ -309,12 +312,19 @@ export default function HomeClient() {
     const setSetting = (key, value) => setSettings((s) => ({ ...s, [key]: value }));
     const updateClip = useCallback((id, patch) => setClips((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c))), []);
 
+    const isIndicLang = INDIC_LANGUAGES.includes(settings.language);
+    const modelWeakForIndic = isIndicLang && settings.model !== HINDI_MODEL;
+
     const handleLanguageChange = (lang) => {
         setSettings((s) => {
-            const m = MODELS.find((x) => x.id === s.model) || MODELS[0];
-            // Automatically switch to a multilingual model if user selects Hindi or any non-English language
-            const nextModel = lang !== "english" && !m.multilingual ? "Xenova/whisper-base" : s.model;
-            return { ...s, language: lang, model: nextModel };
+            // Hindi & other Indic languages: Whisper Tiny/Base (and the English-only models)
+            // produce mostly garbage, so switch to Whisper Small automatically.
+            // The user can still pick another model afterwards.
+            const nextModel = INDIC_LANGUAGES.includes(lang) ? HINDI_MODEL : s.model;
+            const m = MODELS.find((x) => x.id === nextModel) || MODELS[0];
+            // Any other non-English language still needs at least a multilingual model
+            const safeModel = lang !== "english" && lang !== "auto" && !m.multilingual ? "Xenova/whisper-base" : nextModel;
+            return { ...s, language: lang, model: safeModel };
         });
     };
 
@@ -352,6 +362,7 @@ export default function HomeClient() {
     useEffect(() => {
         setYear(new Date().getFullYear());
         setOutputMime(pickMime());
+        ensureCaptionFonts(); // preload the Devanagari font so Hindi captions render correctly
         refreshProjects();
         navigator.storage?.persist?.().catch(() => { });
     }, [refreshProjects]);
@@ -558,6 +569,12 @@ export default function HomeClient() {
         const language = model.multilingual && s.language !== "auto" ? s.language : null;
         let ok = 0;
         try {
+            await ensureCaptionFonts(); // make sure Devanagari glyphs are ready for preview
+            if (INDIC_LANGUAGES.includes(s.language) && s.model !== HINDI_MODEL) {
+                toast("Tip: Whisper Small gives much better Hindi accuracy than Tiny/Base. Change it under “Speech model”.");
+            } else if (s.language === "auto" && !model.multilingual) {
+                toast("You're using an English-only model. Hindi or other languages won't transcribe correctly — pick a Multilingual model.");
+            }
             setCaptionJob({ done: 0, total: list.length, label: "Preparing audio…", current: null });
             const samples = await ensureAudio();
             for (let i = 0; i < list.length; i++) {
@@ -1268,14 +1285,22 @@ export default function HomeClient() {
                                                 <Field label={`Words per caption · ${settings.wordsPerLine}`} hint="Applies the next time captions are generated.">
                                                     <input type="range" min={1} max={8} step={1} value={settings.wordsPerLine} onChange={(e) => setSetting("wordsPerLine", Number(e.target.value))} className="w-full" aria-label="Words per caption" />
                                                 </Field>
-                                                <Field label="Speech model" icon={Cpu} hint="Open-source Whisper, runs locally. Use Multilingual for Hindi and other languages.">
+                                                <Field
+                                                    label="Speech model"
+                                                    icon={Cpu}
+                                                    hint={
+                                                        modelWeakForIndic
+                                                            ? "⚠ Tiny/Base are very inaccurate for Hindi. Choose “Whisper Small” for good Hindi captions."
+                                                            : "Open-source Whisper, runs locally. Use Multilingual for Hindi and other languages."
+                                                    }
+                                                >
                                                     <select value={settings.model} onChange={(e) => setSetting("model", e.target.value)} aria-label="Speech model" className="w-full rounded-xl border border-violet-100 bg-white px-3 py-2 text-xs font-semibold outline-none focus:border-violet-400">
                                                         {MODELS.map((m) => (
                                                             <option key={m.id} value={m.id}>{m.label}</option>
                                                         ))}
                                                     </select>
                                                 </Field>
-                                                <Field label="Language" hint="Select Hindi directly for best Hindi accuracy, or Auto-detect.">
+                                                <Field label="Language" hint="Select Hindi directly for best Hindi accuracy (Auto-detect often guesses Urdu or English for Hindi audio).">
                                                     <select value={settings.language} onChange={(e) => handleLanguageChange(e.target.value)} aria-label="Caption language" className="w-full rounded-xl border border-violet-100 bg-white px-3 py-2 text-xs font-semibold outline-none focus:border-violet-400">
                                                         {LANGUAGES.map(([v, l]) => (
                                                             <option key={v} value={v}>{l}</option>
@@ -1989,7 +2014,7 @@ export default function HomeClient() {
                                     <a href="/terms" className="block hover:text-white">Terms of Service</a>
                                 </div>
                             </nav>
-                         
+
                         </div>
                     </div>
 
