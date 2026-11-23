@@ -6,12 +6,19 @@
  * - Rendering: Canvas (crop / blur-fit / burned-in captions) + MediaRecorder (MP4 where supported)
  * - Storage: IndexedDB (projects + source videos stay on this device)
  *
- * HINDI / INDIC FIXES in this version:
- *  1. Devanagari font is now actually loaded (Google Fonts) and awaited before preview/export.
- *  2. titleFromText() no longer strips Devanagari vowel signs (matras) -> titles were garbled.
- *  3. Caption line-height is taller for Indic scripts so matras don't clip / overlap.
- *  4. Worker: explicit language + task, repetition guard, and a safer fallback chain.
- *  5. Whisper Small is recommended / auto-selected for Hindi (Base/Tiny are very inaccurate for Hindi).
+ * NEW in this version (copyright-safe editing toolkit):
+ *  - Filters, brightness/contrast/saturation, mirror, Ken-Burns zoom, fade in/out, speed
+ *  - Text overlays + emoji stickers with animations, own brand tag, progress bar
+ *  - Royalty-free background music that is SYNTHESISED in the browser (no audio files, no samples,
+ *    so there is nothing third-party to infringe) + original-audio volume + mic voiceover
+ *  - Credits / licence note generator
+ *
+ * HINDI / INDIC FIXES (kept from the previous version):
+ *  1. Devanagari font is loaded (Google Fonts) and awaited before preview/export.
+ *  2. titleFromText() keeps Devanagari vowel signs (matras).
+ *  3. Caption line-height is taller for Indic scripts.
+ *  4. Worker: explicit language + task, repetition guard, safer fallback chain.
+ *  5. Whisper Small is recommended / auto-selected for Hindi.
  */
 
 export const SR = 16000; // Whisper expects 16 kHz mono
@@ -31,6 +38,8 @@ const FONT_HEAVY =
   '"Arial Black", "Noto Sans Devanagari", "Nirmala UI", "Mangal", "Kohinoor Devanagari", Arial, sans-serif';
 const FONT_NORMAL =
   'Arial, "Noto Sans Devanagari", "Nirmala UI", "Mangal", "Kohinoor Devanagari", Helvetica, sans-serif';
+const FONT_EMOJI =
+  '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla", sans-serif';
 
 export const CAPTION_STYLES = {
   bold: {
@@ -113,6 +122,29 @@ export const INDIC_LANGUAGES = [
   "malayalam",
 ];
 
+/* ------------------------- NEW: look & feel presets ------------------------- */
+
+export const FILTERS = {
+  none: { label: "Original", css: "" },
+  vivid: { label: "Vivid", css: "saturate(1.35) contrast(1.08)" },
+  warm: { label: "Warm", css: "sepia(0.25) saturate(1.2) hue-rotate(-8deg)" },
+  cool: { label: "Cool", css: "saturate(1.1) hue-rotate(12deg) brightness(1.03)" },
+  bw: { label: "B&W", css: "grayscale(1) contrast(1.1)" },
+  vintage: { label: "Vintage", css: "sepia(0.5) contrast(0.95) brightness(1.05) saturate(0.9)" },
+  cinema: { label: "Cinema", css: "contrast(1.15) saturate(0.9) brightness(0.95)" },
+};
+
+export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+export const BRAND_POSITIONS = {
+  tl: "Top left",
+  tr: "Top right",
+  bl: "Bottom left",
+  br: "Bottom right",
+};
+
+export const STICKERS = ["🔥", "😂", "❤️", "👍", "🚀", "⭐", "💯", "👀", "🎉", "✅"];
+
 export const DEFAULT_SETTINGS = {
   clipLength: 30,
   clipCount: 5,
@@ -127,7 +159,47 @@ export const DEFAULT_SETTINGS = {
   wordsPerLine: 4,
   model: "Xenova/whisper-base",
   language: "auto",
+  /* --- new: video look --- */
+  filter: "none",
+  brightness: 1,
+  contrast: 1,
+  saturation: 1,
+  speed: 1,
+  mirror: false,
+  zoom: "none", // none | in | out  (slow Ken-Burns move)
+  zoomAmount: 0.15,
+  fadeIn: 0,
+  fadeOut: 0,
+  progressBar: false,
+  progressColor: "#a855f7",
+  brandText: "",
+  brandPos: "br",
+  /* --- new: audio --- */
+  originalVolume: 1,
+  musicTrack: "none",
+  musicVolume: 0.45,
+  voiceVolume: 1,
+  /* --- new: rights --- */
+  rightsConfirmed: false,
+  sourceLicense: "",
 };
+
+export const supportsCanvasFilter = () =>
+  typeof CanvasRenderingContext2D !== "undefined" && "filter" in CanvasRenderingContext2D.prototype;
+
+/** Builds the CSS filter string used on the canvas (preview, thumbnails and export). */
+export function filterString(s) {
+  const parts = [];
+  const preset = FILTERS[s.filter]?.css;
+  if (preset) parts.push(preset);
+  const b = Number(s.brightness) || 1;
+  const c = Number(s.contrast) || 1;
+  const sat = Number(s.saturation) || 1;
+  if (Math.abs(b - 1) > 0.005) parts.push(`brightness(${b})`);
+  if (Math.abs(c - 1) > 0.005) parts.push(`contrast(${c})`);
+  if (Math.abs(sat - 1) > 0.005) parts.push(`saturate(${sat})`);
+  return parts.length ? parts.join(" ") : "none";
+}
 
 /* ----------------------------- small utils ----------------------------- */
 
@@ -343,11 +415,13 @@ function wrapText(ctx, text, maxW) {
   return lines;
 }
 
+/** Draws caption-style text. `captionX` (0–1) lets overlays be placed anywhere horizontally. */
 export function drawCaption(ctx, text, W, H, o = {}) {
   const st = CAPTION_STYLES[o.captionStyle] || CAPTION_STYLES.bold;
   const indic = INDIC_RE.test(text);
   const fs = Math.round(Math.min(W, H) * 0.072 * (o.captionSize || 1));
   const t = st.upper && !indic ? text.toUpperCase() : text;
+  const cx = W * (o.captionX ?? 0.5);
   ctx.save();
   ctx.font = `${st.weight} ${fs}px ${st.font}`;
   ctx.textAlign = "center";
@@ -361,55 +435,212 @@ export function drawCaption(ctx, text, W, H, o = {}) {
     const y = top + i * lh;
     if (st.box) {
       const w = ctx.measureText(ln).width + fs * 0.8;
-      roundRectPath(ctx, W / 2 - w / 2, y - lh / 2, w, lh, fs * 0.25);
+      roundRectPath(ctx, cx - w / 2, y - lh / 2, w, lh, fs * 0.25);
       ctx.fillStyle = st.box;
       ctx.fill();
     }
     if (st.stroke) {
       ctx.lineWidth = fs * (indic ? 0.14 : 0.2); // thinner stroke keeps small matras readable
       ctx.strokeStyle = st.stroke;
-      ctx.strokeText(ln, W / 2, y);
+      ctx.strokeText(ln, cx, y);
     }
     ctx.fillStyle = st.fill;
-    ctx.fillText(ln, W / 2, y);
+    ctx.fillText(ln, cx, y);
   });
   ctx.restore();
 }
 
-/** Draws one output frame. Shared by live preview, thumbnails and export → WYSIWYG. */
+/** Animated text / emoji overlay. `ov.start` / `ov.end` are absolute source-video seconds. */
+export function drawOverlay(ctx, ov, W, H, t) {
+  if (!ov || !ov.text || t < ov.start || t >= ov.end) return;
+  const age = t - ov.start;
+  const left = ov.end - t;
+  const IN = 0.3;
+  let alpha = 1;
+  let scale = 1;
+  let dy = 0;
+  const k = clamp(age / IN, 0, 1);
+  switch (ov.anim || "pop") {
+    case "fade":
+      alpha = k;
+      break;
+    case "pop":
+      scale = 0.6 + 0.4 * k + Math.sin(k * Math.PI) * 0.12;
+      alpha = k;
+      break;
+    case "slide":
+      dy = (1 - k) * H * 0.05;
+      alpha = k;
+      break;
+    default:
+      break;
+  }
+  if (left < 0.25) alpha *= clamp(left / 0.25, 0, 1);
+  const cx = W * (ov.x ?? 0.5);
+  const cy = H * (ov.y ?? 0.3) + dy;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+  ctx.translate(-cx, -cy);
+  if (ov.type === "sticker") {
+    const fs = Math.round(Math.min(W, H) * 0.16 * (ov.size || 1));
+    ctx.font = `${fs}px ${FONT_EMOJI}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(ov.text, cx, cy);
+  } else {
+    drawCaption(ctx, ov.text, W, H, {
+      captionStyle: ov.style || "bold",
+      captionPos: cy / H,
+      captionSize: ov.size || 1,
+      captionX: ov.x ?? 0.5,
+    });
+  }
+  ctx.restore();
+}
+
+function drawBrand(ctx, text, W, H, pos = "br") {
+  const fs = Math.max(11, Math.round(Math.min(W, H) * 0.036));
+  const m = Math.min(W, H) * 0.04;
+  ctx.save();
+  ctx.font = `700 ${fs}px ${FONT_NORMAL}`;
+  ctx.textBaseline = "middle";
+  ctx.globalAlpha = 0.8;
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = fs * 0.35;
+  ctx.fillStyle = "#fff";
+  const right = pos === "tr" || pos === "br";
+  const top = pos === "tl" || pos === "tr";
+  ctx.textAlign = right ? "right" : "left";
+  ctx.fillText(text, right ? W - m : m, top ? m + fs / 2 : H - m - fs / 2);
+  ctx.restore();
+}
+
+/**
+ * Draws one output frame. Shared by live preview, thumbnails and export → WYSIWYG.
+ * Extra (all optional) options: filter, mirror, zoom, fade, progress, progressColor,
+ * overlays, t, brandText, brandPos.
+ */
 export function drawFrame(ctx, video, W, H, o = {}) {
+  // Always start from a clean canvas state, so a failed earlier frame can never leave a
+  // mirror / zoom transform, filter or alpha behind (that would push captions off-screen).
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+  ctx.filter = "none";
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, W, H);
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (vw && vh && video.readyState >= 2) {
-    if (o.layout === "blur") {
-      // Cheap blur: draw into a tiny canvas, then upscale with smoothing
-      const bg = o.bgCanvas || document.createElement("canvas");
-      const bw = Math.max(16, Math.round(W / 14));
-      const bh = Math.max(16, Math.round(H / 14));
-      if (bg.width !== bw || bg.height !== bh) {
-        bg.width = bw;
-        bg.height = bh;
+    ctx.save();
+    try {
+      if (o.mirror) {
+        ctx.translate(W, 0);
+        ctx.scale(-1, 1);
       }
-      const bctx = bg.getContext("2d");
-      drawCover(bctx, video, bw, bh, 0.5, 0.5);
-      ctx.save();
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(bg, 0, 0, W, H);
-      ctx.fillStyle = "rgba(0,0,0,0.35)";
-      ctx.fillRect(0, 0, W, H);
+      if (o.zoom && o.zoom !== 1) {
+        ctx.translate(W / 2, H / 2);
+        ctx.scale(o.zoom, o.zoom);
+        ctx.translate(-W / 2, -H / 2);
+      }
+      if (o.filter && o.filter !== "none") ctx.filter = o.filter;
+      if (o.layout === "blur") {
+        // Cheap blur: draw into a tiny canvas, then upscale with smoothing
+        const bg = o.bgCanvas || document.createElement("canvas");
+        const bw = Math.max(16, Math.round(W / 14));
+        const bh = Math.max(16, Math.round(H / 14));
+        if (bg.width !== bw || bg.height !== bh) {
+          bg.width = bw;
+          bg.height = bh;
+        }
+        const bctx = bg.getContext("2d");
+        drawCover(bctx, video, bw, bh, 0.5, 0.5);
+        ctx.save();
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(bg, 0, 0, W, H);
+        ctx.fillStyle = "rgba(0,0,0,0.35)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+        const sc = Math.min(W / vw, H / vh);
+        const dw = vw * sc;
+        const dh = vh * sc;
+        ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      } else {
+        drawCover(ctx, video, W, H, o.focusX ?? 0.5, 0.5);
+      }
+    } catch {
+      /* video frame not ready: keep the black frame and still draw captions */
+    } finally {
       ctx.restore();
-      const s = Math.min(W / vw, H / vh);
-      const dw = vw * s;
-      const dh = vh * s;
-      ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
-    } else {
-      drawCover(ctx, video, W, H, o.focusX ?? 0.5, 0.5);
     }
   }
-  if (o.caption) drawCaption(ctx, o.caption, W, H, o);
+  // Captions come first and are isolated: nothing below can stop them from drawing.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.filter = "none";
+  if (o.caption) {
+    try {
+      drawCaption(ctx, o.caption, W, H, o);
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    if (o.overlays?.length) for (const ov of o.overlays) drawOverlay(ctx, ov, W, H, o.t ?? 0);
+    if (o.brandText) drawBrand(ctx, o.brandText, W, H, o.brandPos);
+    if (o.progress != null) {
+      const bh = Math.max(4, Math.round(H * 0.008));
+      ctx.fillStyle = "rgba(255,255,255,0.22)";
+      ctx.fillRect(0, H - bh, W, bh);
+      ctx.fillStyle = o.progressColor || "#a855f7";
+      ctx.fillRect(0, H - bh, W * clamp(o.progress, 0, 1), bh);
+    }
+    if (o.fade > 0.002) {
+      ctx.fillStyle = `rgba(0,0,0,${clamp(o.fade, 0, 1)})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Turns project settings + a clip + the current time into drawFrame() options. */
+export function buildFrameOpts(s, clip, t, bgCanvas) {
+  const start = clip?.start ?? 0;
+  const end = clip?.end ?? start + 1;
+  const len = Math.max(0.1, end - start);
+  const rel = clamp(t - start, 0, len);
+  const amount = Number(s.zoomAmount) || 0;
+  let zoom = 1;
+  if (s.zoom === "in") zoom = 1 + amount * (rel / len);
+  else if (s.zoom === "out") zoom = 1 + amount * (1 - rel / len);
+  const fi = clamp(Number(s.fadeIn) || 0, 0, len / 2);
+  const fo = clamp(Number(s.fadeOut) || 0, 0, len / 2);
+  let fade = 0;
+  if (fi > 0 && rel < fi) fade = Math.max(fade, 1 - rel / fi);
+  if (fo > 0 && len - rel < fo) fade = Math.max(fade, 1 - (len - rel) / fo);
+  return {
+    layout: s.layout,
+    focusX: clip?.focusX ?? 0.5,
+    bgCanvas,
+    caption: s.captions && clip ? captionAt(clip.captions, t) : null,
+    captionStyle: s.captionStyle,
+    captionPos: s.captionPos,
+    captionSize: s.captionSize,
+    filter: filterString(s),
+    mirror: !!s.mirror,
+    zoom,
+    fade,
+    progress: s.progressBar && clip ? rel / len : null,
+    progressColor: s.progressColor,
+    overlays: clip?.overlays,
+    t,
+    brandText: (s.brandText || "").trim(),
+    brandPos: s.brandPos,
+  };
 }
 
 export const captionAt = (captions, t) => {
@@ -746,7 +977,7 @@ export function buildCaptions(chunks, offset, clipDur, maxWords = 4) {
 }
 
 /**
- * FIX: \p{M} (combining marks) is required, otherwise Devanagari vowel signs
+ * \p{M} (combining marks) is required, otherwise Devanagari vowel signs
  * (matras like ा ि ी ु ू े ै ो ौ ं ः ्) are replaced by spaces and Hindi words get shredded.
  */
 export function titleFromText(text, fallback) {
@@ -760,11 +991,288 @@ export function titleFromText(text, fallback) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+/* ------------------- NEW: royalty-free synthesised music ------------------- */
+/*
+ * Every track is generated live from oscillators and noise (pads, bass, arpeggios, drums).
+ * No recordings, samples or third-party melodies are used, so the audio is original to this app.
+ * As the site owner, state your own licence for these generated tracks in your Terms page.
+ */
+
+const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+// prog: [rootOffsetSemitones, chordIntervals] — one chord per bar (16 sixteenth-note steps)
+const TRACK_DEFS = {
+  lofi: {
+    bpm: 76,
+    root: 57,
+    pad: "triangle",
+    prog: [
+      [0, [0, 3, 7, 10]],
+      [5, [0, 4, 7, 11]],
+      [3, [0, 4, 7, 11]],
+      [7, [0, 4, 7, 10]],
+    ],
+    bass: "x.....x...x.....",
+    arp: null,
+    kick: "x.......x.x.....",
+    snare: "....x.......x...",
+    hat: "x.x.x.x.x.x.x.xx",
+    hatVol: 0.08,
+  },
+  upbeat: {
+    bpm: 118,
+    root: 60,
+    pad: "sawtooth",
+    prog: [
+      [0, [0, 4, 7]],
+      [7, [0, 4, 7]],
+      [9, [0, 3, 7]],
+      [5, [0, 4, 7]],
+    ],
+    bass: "x..x..x.x..x..x.",
+    arp: "x.x.x.x.x.x.x.x.",
+    kick: "x...x...x...x...",
+    snare: "....x.......x...",
+    hat: ".x.x.x.x.x.x.x.x",
+    hatVol: 0.12,
+  },
+  ambient: {
+    bpm: 62,
+    root: 55,
+    pad: "sine",
+    prog: [
+      [0, [0, 7, 12, 16]],
+      [5, [0, 7, 12, 16]],
+      [9, [0, 7, 12, 15]],
+      [7, [0, 7, 12, 16]],
+    ],
+    bass: "x...............",
+    arp: "x...x...x...x...",
+    kick: null,
+    snare: null,
+    hat: null,
+    hatVol: 0,
+  },
+  cinematic: {
+    bpm: 92,
+    root: 50,
+    pad: "sawtooth",
+    prog: [
+      [0, [0, 3, 7]],
+      [8, [0, 4, 7]],
+      [3, [0, 4, 7]],
+      [10, [0, 4, 7]],
+    ],
+    bass: "x.......x.......",
+    arp: null,
+    kick: "x.......x...x...",
+    snare: "........x.......",
+    hat: null,
+    hatVol: 0,
+  },
+  groove: {
+    bpm: 104,
+    root: 52,
+    pad: "square",
+    prog: [
+      [0, [0, 3, 7, 10]],
+      [0, [0, 3, 7, 10]],
+      [5, [0, 3, 7, 10]],
+      [7, [0, 3, 7, 10]],
+    ],
+    bass: "x..x.xx.x..x.x.x",
+    arp: null,
+    kick: "x..x..x...x...x.",
+    snare: "....x.......x..x",
+    hat: "x.x.x.x.x.x.x.x.",
+    hatVol: 0.1,
+  },
+};
+
+export const MUSIC_TRACKS = [
+  { id: "none", label: "No music" },
+  { id: "lofi", label: "Lo-fi Chill · 76 BPM" },
+  { id: "upbeat", label: "Upbeat Pop · 118 BPM" },
+  { id: "ambient", label: "Calm Ambient · 62 BPM" },
+  { id: "cinematic", label: "Cinematic Pulse · 92 BPM" },
+  { id: "groove", label: "Funk Groove · 104 BPM" },
+];
+
+function makeNoiseBuffer(ac) {
+  const buf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+/**
+ * Starts a looping, procedurally generated track on `out`.
+ * Returns { start, stop, setVolume } or null for an unknown track id.
+ */
+export function createMusicPlayer(ac, out, trackId, volume = 0.45) {
+  const def = TRACK_DEFS[trackId];
+  if (!def) return null;
+  const master = ac.createGain();
+  master.gain.value = volume;
+  master.connect(out);
+  const noise = makeNoiseBuffer(ac);
+  const stepDur = 60 / def.bpm / 4;
+  const barDur = stepDur * 16;
+  const LOOKAHEAD = 1.2;
+  let step = 0;
+  let next = 0;
+  let timer = null;
+
+  const tone = (freq, time, dur, type, vol, attack = 0.01) => {
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, time);
+    g.gain.linearRampToValueAtTime(vol, time + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+    o.connect(g);
+    g.connect(master);
+    o.start(time);
+    o.stop(time + dur + 0.05);
+  };
+
+  const burst = (time, dur, vol, hp) => {
+    const s = ac.createBufferSource();
+    s.buffer = noise;
+    const f = ac.createBiquadFilter();
+    f.type = "highpass";
+    f.frequency.value = hp;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(vol, time);
+    g.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+    s.connect(f);
+    f.connect(g);
+    g.connect(master);
+    s.start(time);
+    s.stop(time + dur + 0.02);
+  };
+
+  const kick = (time) => {
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(150, time);
+    o.frequency.exponentialRampToValueAtTime(45, time + 0.12);
+    g.gain.setValueAtTime(0.9, time);
+    g.gain.exponentialRampToValueAtTime(0.0001, time + 0.22);
+    o.connect(g);
+    g.connect(master);
+    o.start(time);
+    o.stop(time + 0.25);
+  };
+
+  const playStep = (s, time) => {
+    const pos = s % 16;
+    const bar = Math.floor(s / 16) % def.prog.length;
+    const [rootOff, chord] = def.prog[bar];
+    const base = def.root + rootOff;
+    if (pos === 0) {
+      chord.forEach((iv) => tone(mtof(base + iv), time, barDur * 0.98, def.pad, 0.07, 0.25));
+    }
+    if (def.bass && def.bass[pos] === "x") tone(mtof(base - 24), time, stepDur * 3, "sine", 0.34, 0.01);
+    if (def.arp && def.arp[pos] === "x") {
+      const n = chord[(s >> 1) % chord.length] + 12;
+      tone(mtof(base + n), time, stepDur * 1.8, "triangle", 0.1, 0.005);
+    }
+    if (def.kick && def.kick[pos] === "x") kick(time);
+    if (def.snare && def.snare[pos] === "x") {
+      burst(time, 0.16, 0.32, 1500);
+      tone(190, time, 0.1, "triangle", 0.15, 0.002);
+    }
+    if (def.hat && def.hat[pos] === "x") burst(time, 0.045, def.hatVol, 7000);
+  };
+
+  const schedule = () => {
+    while (next < ac.currentTime + LOOKAHEAD) {
+      playStep(step, next);
+      next += stepDur;
+      step++;
+    }
+  };
+
+  return {
+    start() {
+      next = ac.currentTime + 0.05;
+      schedule();
+      timer = setInterval(schedule, 150);
+    },
+    stop() {
+      clearInterval(timer);
+      timer = null;
+      try {
+        master.gain.cancelScheduledValues(ac.currentTime);
+        master.gain.setValueAtTime(0, ac.currentTime);
+        master.disconnect();
+      } catch {
+        /* context already closed */
+      }
+    },
+    setVolume(v) {
+      master.gain.value = v;
+    },
+  };
+}
+
+/* ---------------------------- NEW: voiceover ---------------------------- */
+
+/** Starts recording the microphone. Call `.stop()` to get `{ blob }`. */
+export async function startVoiceRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined")
+    throw new Error("This browser can't record from a microphone");
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+  });
+  const mime = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((m) => MediaRecorder.isTypeSupported(m));
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  const parts = [];
+  rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
+  const stopped = new Promise((r) => (rec.onstop = r));
+  rec.start();
+  return {
+    async stop() {
+      if (rec.state !== "inactive") rec.stop();
+      await stopped;
+      stream.getTracks().forEach((t) => t.stop());
+      return { blob: new Blob(parts, { type: rec.mimeType || mime || "audio/webm" }) };
+    },
+  };
+}
+
+/* ------------------------- NEW: credits / licence note ------------------------- */
+
+export function buildCreditsText({ projectName, settings, clips }) {
+  const track = MUSIC_TRACKS.find((t) => t.id === settings.musicTrack);
+  const voice = (clips || []).some((c) => c.voice);
+  const lines = [
+    `Credits & licence note — ${projectName || "Untitled"}`,
+    `Created: ${new Date().toLocaleDateString()} with LongToShorts (longtoshorts.in)`,
+    "",
+    `Source footage: ${(settings.sourceLicense || "").trim() || "[add the owner / licence of your source video here]"}`,
+    track && track.id !== "none"
+      ? `Music: "${track.label.split(" · ")[0]}" — royalty-free, generated in the browser by LongToShorts (no third-party recordings or samples).`
+      : "Music: none added.",
+    settings.originalVolume === 0 ? "Original audio: removed." : `Original audio: kept at ${Math.round((settings.originalVolume ?? 1) * 100)}% volume.`,
+    voice ? "Voiceover: recorded by the creator." : null,
+    settings.captions ? "Captions: generated on-device with open-source Whisper and edited by the creator." : null,
+    "Stickers: standard system emoji.",
+    "",
+    "Reminder: editing, cropping or filtering a video does not change who owns it. Only publish footage you own or are licensed to use.",
+  ];
+  return lines.filter((l) => l !== null).join("\n");
+}
+
 /* ------------------------------- export ------------------------------- */
 
 /**
  * Renders a clip in real time through a canvas and records it with MediaRecorder.
  * Output: MP4 (H.264/AAC) in Chrome, Edge & Safari; WebM in Firefox. No watermark.
+ * Mixes: original audio (volume), generated music, optional voiceover; applies speed + fades.
  */
 export async function renderClip({ src, clip, settings, onProgress, signal }) {
   const mime = pickMime();
@@ -788,12 +1296,49 @@ export async function renderClip({ src, clip, settings, onProgress, signal }) {
   const AC = window.AudioContext || window.webkitAudioContext;
   const ac = new AC();
   let stream;
+  let music = null;
+  let voiceNode = null;
   try {
     await once(video, "loadedmetadata");
     await ac.resume();
-    const srcNode = ac.createMediaElementSource(video);
+
+    const speed = clamp(Number(settings.speed) || 1, 0.25, 4);
+    const len = Math.max(0.1, clip.end - clip.start);
+    const realLen = len / speed;
+
+    // audio graph:  video → origGain ┐
+    //               music ──────────┼→ mix → dest (recorded)   [never connected to speakers]
+    //               voiceover ──────┘
     const dest = ac.createMediaStreamDestination();
-    srcNode.connect(dest); // not connected to speakers → silent render
+    const mix = ac.createGain();
+    mix.connect(dest);
+
+    const srcNode = ac.createMediaElementSource(video);
+    const origGain = ac.createGain();
+    origGain.gain.value = clamp(settings.originalVolume ?? 1, 0, 2);
+    srcNode.connect(origGain);
+    origGain.connect(mix);
+
+    let voiceBuffer = null;
+    if (clip.voice?.blob) {
+      try {
+        voiceBuffer = await ac.decodeAudioData(await clip.voice.blob.arrayBuffer());
+      } catch {
+        voiceBuffer = null; // undecodable in this browser: export without it
+      }
+    }
+    if (settings.musicTrack && settings.musicTrack !== "none") {
+      const vol = clamp(settings.musicVolume ?? 0.45, 0, 1) * (voiceBuffer ? 0.45 : 1); // auto-duck under voice
+      music = createMusicPlayer(ac, mix, settings.musicTrack, vol);
+    }
+    if (voiceBuffer) {
+      voiceNode = ac.createBufferSource();
+      voiceNode.buffer = voiceBuffer;
+      const vg = ac.createGain();
+      vg.gain.value = clamp(settings.voiceVolume ?? 1, 0, 2);
+      voiceNode.connect(vg);
+      vg.connect(mix);
+    }
 
     stream = canvas.captureStream(30);
     dest.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
@@ -808,29 +1353,32 @@ export async function renderClip({ src, clip, settings, onProgress, signal }) {
     const stopped = new Promise((r) => (rec.onstop = r));
 
     await seekTo(video, clip.start);
-    const opts = {
-      layout: settings.layout,
-      focusX: clip.focusX ?? 0.5,
-      bgCanvas,
-      captionStyle: settings.captionStyle,
-      captionPos: settings.captionPos,
-      captionSize: settings.captionSize,
-    };
-    const draw = () =>
-      drawFrame(ctx, video, W, H, {
-        ...opts,
-        caption: settings.captions ? captionAt(clip.captions, video.currentTime) : null,
-      });
+    const draw = () => drawFrame(ctx, video, W, H, buildFrameOpts(settings, clip, video.currentTime, bgCanvas));
     draw();
     rec.start(500);
     try {
+      video.playbackRate = speed;
       await video.play();
     } catch {
       rec.stop();
       throw new Error("Playback was blocked by the browser. Click Export again.");
     }
 
-    const len = Math.max(0.1, clip.end - clip.start);
+    // start music / voice / audio fades in step with playback
+    const t0 = ac.currentTime;
+    const fi = clamp(Number(settings.fadeIn) || 0, 0, len / 2) / speed;
+    const fo = clamp(Number(settings.fadeOut) || 0, 0, len / 2) / speed;
+    if (fi > 0) {
+      mix.gain.setValueAtTime(0.0001, t0);
+      mix.gain.linearRampToValueAtTime(1, t0 + fi);
+    }
+    if (fo > 0) {
+      mix.gain.setValueAtTime(1, t0 + Math.max(fi, realLen - fo));
+      mix.gain.linearRampToValueAtTime(0.0001, t0 + realLen);
+    }
+    music?.start();
+    voiceNode?.start(t0);
+
     await new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -862,12 +1410,19 @@ export async function renderClip({ src, clip, settings, onProgress, signal }) {
       schedule();
     });
 
+    music?.stop();
+    try {
+      voiceNode?.stop();
+    } catch {
+      /* already ended */
+    }
     rec.stop();
     await stopped;
     if (signal?.aborted) throw new Error("cancelled");
     const type = mime.split(";")[0];
     return { blob: new Blob(parts, { type }), ext: type === "video/mp4" ? "mp4" : "webm" };
   } finally {
+    music?.stop();
     stream?.getTracks().forEach((t) => t.stop());
     ac.close?.();
     video.pause();
@@ -884,7 +1439,15 @@ export async function captureThumb(video, clip, settings) {
   const c = document.createElement("canvas");
   c.width = W;
   c.height = H;
-  drawFrame(c.getContext("2d"), video, W, H, { layout: settings.layout, focusX: clip.focusX ?? 0.5 });
+  const o = buildFrameOpts(settings, clip, t);
+  drawFrame(c.getContext("2d"), video, W, H, {
+    ...o,
+    caption: null,
+    overlays: null,
+    progress: null,
+    fade: 0,
+    brandText: "",
+  });
   return c.toDataURL("image/jpeg", 0.75);
 }
 

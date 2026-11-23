@@ -46,6 +46,10 @@ import {
     Info,
     CircleAlert,
     CircleCheck,
+    Music,
+    Mic,
+    Layers,
+    SplitSquareHorizontal,
 } from "lucide-react";
 import {
     SR,
@@ -69,7 +73,11 @@ import {
     pickMime,
     ensureCaptionFonts,
     drawFrame,
-    captionAt,
+    buildFrameOpts,
+    supportsCanvasFilter,
+    createMusicPlayer,
+    startVoiceRecording,
+    buildCreditsText,
     decodeMonoAudio,
     computeEnergy,
     downsampleEnergy,
@@ -88,6 +96,7 @@ import {
 } from "./engine";
 import { SITE } from "./site";
 import { FAQS, USE_CASES } from "./content";
+import { EffectsPanel, AudioPanel, OverlayEditor, VoiceoverCard, CopyrightKit } from "./StudioExtras";
 
 /* Loaded client-only: audio tools usually touch AudioContext / window, which don't exist during SSR.
    Adjust the path if this file doesn't live next to the "components" folder. */
@@ -182,6 +191,7 @@ body { margin: 0; font-family: Arial, Helvetica, sans-serif; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .toast-in { animation: toast-in .25s ease; }
 input[type=range] { accent-color: #7c3aed; }
+details > summary::-webkit-details-marker { display: none; }
 :focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
@@ -282,6 +292,9 @@ export default function HomeClient() {
     const [playing, setPlaying] = useState(false);
     const [curTime, setCurTime] = useState(0);
     const [outputMime, setOutputMime] = useState(null);
+    const [filterSupported, setFilterSupported] = useState(true);
+    const [recordingId, setRecordingId] = useState(null);
+    const [musicPreviewing, setMusicPreviewing] = useState(false);
 
     const fileRef = useRef(null);
     const audioRef = useRef(null);
@@ -300,6 +313,9 @@ export default function HomeClient() {
     const exportAbortRef = useRef(null);
     const captionBusyRef = useRef(false);
     const modelProgressRef = useRef({});
+    const recorderRef = useRef(null);
+    const previewAcRef = useRef(null);
+    const previewPlayerRef = useRef(null);
     const [thumbTick, setThumbTick] = useState(0);
 
     useEffect(() => { clipsRef.current = clips; }, [clips]);
@@ -362,6 +378,7 @@ export default function HomeClient() {
     useEffect(() => {
         setYear(new Date().getFullYear());
         setOutputMime(pickMime());
+        setFilterSupported(supportsCanvasFilter());
         ensureCaptionFonts(); // preload the Devanagari font so Hindi captions render correctly
         refreshProjects();
         navigator.storage?.persist?.().catch(() => { });
@@ -378,8 +395,90 @@ export default function HomeClient() {
         return () => clearTimeout(t);
     }, [project, meta, settings, clips, energyPreview, refreshProjects]);
 
+    /* ---------- music preview ---------- */
+    const stopMusicPreview = useCallback(() => {
+        previewPlayerRef.current?.stop();
+        previewPlayerRef.current = null;
+        previewAcRef.current?.close?.();
+        previewAcRef.current = null;
+        setMusicPreviewing(false);
+    }, []);
+
+    const toggleMusicPreview = async () => {
+        if (previewPlayerRef.current) {
+            stopMusicPreview();
+            return;
+        }
+        if (settings.musicTrack === "none") return;
+        try {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            const ac = new AC();
+            await ac.resume();
+            const player = createMusicPlayer(ac, ac.destination, settings.musicTrack, settings.musicVolume);
+            if (!player) {
+                ac.close?.();
+                return;
+            }
+            player.start();
+            previewAcRef.current = ac;
+            previewPlayerRef.current = player;
+            setMusicPreviewing(true);
+        } catch (e) {
+            toast(`Couldn't play the preview: ${e.message}`, "error");
+        }
+    };
+
+    // Keep preview in sync with the track / volume pickers
+    useEffect(() => { stopMusicPreview(); }, [settings.musicTrack, stopMusicPreview]);
+    useEffect(() => { previewPlayerRef.current?.setVolume(settings.musicVolume); }, [settings.musicVolume]);
+    useEffect(() => () => stopMusicPreview(), [stopMusicPreview]);
+
+    /* ---------- voiceover recording ---------- */
+    const finishRecording = useCallback(async () => {
+        const r = recorderRef.current;
+        if (!r) return;
+        recorderRef.current = null; // guard against re-entry from the pause event
+        const v = editorVideoRef.current;
+        v?.pause();
+        if (v) v.muted = false;
+        setRecordingId(null);
+        try {
+            const { blob } = await r.rec.stop();
+            if (blob.size > 0) updateClip(r.clipId, { voice: { blob } });
+        } catch (e) {
+            toast(`Voiceover failed: ${e.message}`, "error");
+        }
+    }, [updateClip, toast]);
+
+    const toggleRecording = async () => {
+        if (recorderRef.current) {
+            await finishRecording();
+            return;
+        }
+        const v = editorVideoRef.current;
+        const clip = selectedClip;
+        if (!v || !clip) return;
+        try {
+            v.pause();
+            await seekTo(v, clip.start);
+            const rec = await startVoiceRecording();
+            recorderRef.current = { rec, clipId: clip.id };
+            setRecordingId(clip.id);
+            v.muted = true; // so the mic doesn't pick up the original audio
+            await v.play();
+        } catch (e) {
+            if (recorderRef.current) await finishRecording();
+            toast(e?.name === "NotAllowedError" ? "Microphone access was blocked. Allow it in your browser's site settings." : `Couldn't start recording: ${e.message}`, "error");
+        }
+    };
+
     const resetStudio = useCallback(() => {
         exportAbortRef.current?.abort();
+        if (recorderRef.current) {
+            recorderRef.current.rec.stop().catch(() => { });
+            recorderRef.current = null;
+            setRecordingId(null);
+        }
         Object.values(exportsRef.current).forEach((e) => e?.url && URL.revokeObjectURL(e.url));
         setVideoUrl((u) => {
             if (u) URL.revokeObjectURL(u);
@@ -642,6 +741,7 @@ export default function HomeClient() {
             transcript: "",
             thumb: null,
             thumbKey: "",
+            overlays: [],
         }));
         clipsRef.current = newClips;
         setClips(newClips);
@@ -657,7 +757,7 @@ export default function HomeClient() {
         const len = Math.min(meta.duration, clamp(Number(settings.clipLength) || 30, 3, 600));
         const t = editorVideoRef.current?.currentTime || 0;
         const start = clamp(t, 0, Math.max(0, meta.duration - len));
-        const c = { id: uid(), title: `Custom clip ${clips.length + 1}`, start: +start.toFixed(2), end: +(start + len).toFixed(2), score: null, focusX: 0.5, captions: null, transcript: "", thumb: null, thumbKey: "" };
+        const c = { id: uid(), title: `Custom clip ${clips.length + 1}`, start: +start.toFixed(2), end: +(start + len).toFixed(2), score: null, focusX: 0.5, captions: null, transcript: "", thumb: null, thumbKey: "", overlays: [] };
         setClips((cs) => [...cs, c]);
         setSelectedId(c.id);
     };
@@ -668,6 +768,85 @@ export default function HomeClient() {
         setExportQueue((q) => q.filter((x) => x !== id));
         setClips((cs) => cs.filter((c) => c.id !== id));
         if (selectedId === id) setSelectedId(clips.find((c) => c.id !== id)?.id || null);
+    };
+
+    /* split one clip in two at the playhead */
+    const splitClip = (clip) => {
+        const t = editorVideoRef.current?.currentTime ?? curTime;
+        if (t - clip.start < 1 || clip.end - t < 1) {
+            toast("Move the playhead at least 1 second inside the clip to split it.", "error");
+            return;
+        }
+        const cut = +t.toFixed(2);
+        const first = {
+            ...clip,
+            end: cut,
+            thumb: null,
+            thumbKey: "",
+            captions: clip.captions ? clip.captions.filter((c) => c.start < cut) : null,
+            overlays: (clip.overlays || []).filter((o) => o.start < cut).map((o) => ({ ...o, end: Math.min(o.end, cut) })),
+        };
+        const second = {
+            ...clip,
+            id: uid(),
+            title: `${clip.title} (2)`,
+            start: cut,
+            titleEdited: true,
+            thumb: null,
+            thumbKey: "",
+            voice: undefined,
+            score: null,
+            captions: clip.captions ? clip.captions.filter((c) => c.end > cut) : null,
+            overlays: (clip.overlays || []).filter((o) => o.end > cut).map((o) => ({ ...o, id: uid(), start: Math.max(o.start, cut) })),
+        };
+        const old = exportsRef.current[clip.id];
+        if (old?.url) URL.revokeObjectURL(old.url);
+        setExportsState((st) => ({ ...st, [clip.id]: { status: "idle", progress: 0 } }));
+        setClips((cs) => cs.flatMap((c) => (c.id === clip.id ? [first, second] : [c])));
+        toast("Clip split in two.", "success");
+    };
+
+    /* ---------- copyright-safe toolkit ---------- */
+    const applySafeAudioPreset = () => {
+        setSettings((s) => ({
+            ...s,
+            originalVolume: 0,
+            musicTrack: s.musicTrack === "none" ? "lofi" : s.musicTrack,
+            musicVolume: Math.max(s.musicVolume, 0.5),
+        }));
+        toast("Original audio muted and royalty-free music turned on. Pick another track under Audio & music.", "success");
+    };
+
+    const addOutroToAll = () => {
+        if (!clips.length) {
+            toast("Generate clips first.", "info");
+            return;
+        }
+        setClips((cs) =>
+            cs.map((c) => {
+                const start = Math.max(c.start, c.end - 3);
+                return { ...c, overlays: [...(c.overlays || []), { id: uid(), type: "text", text: "Follow for more!", start: +start.toFixed(2), end: c.end, x: 0.5, y: 0.45, size: 1.1, style: "violet", anim: "pop" }] };
+            })
+        );
+        toast("Added a call-to-action ending to every clip. Edit it under Text & stickers.", "success");
+    };
+
+    const creditsText = () => buildCreditsText({ projectName: project?.name, settings, clips });
+
+    const downloadCredits = () => {
+        const blob = new Blob([creditsText()], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        downloadBlob(url, `${slugify(project?.name || "longtoshorts") || "longtoshorts"}-credits.txt`);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+    };
+
+    const copyCredits = async () => {
+        try {
+            await navigator.clipboard.writeText(creditsText());
+            toast("Credits copied. Paste them into your video description.", "success");
+        } catch {
+            toast("Couldn't access the clipboard. Use the .txt download instead.", "error");
+        }
     };
 
     /* ---------- exports ---------- */
@@ -748,7 +927,8 @@ export default function HomeClient() {
     /* ---------- thumbnails (sequential background queue) ---------- */
     useEffect(() => {
         if (!videoUrl || thumbBusyRef.current || !thumbVideoRef.current) return;
-        const keyOf = (c) => `${c.start}|${c.focusX}|${settings.aspect}|${settings.layout}`;
+        const keyOf = (c) =>
+            `${c.start}|${c.focusX}|${settings.aspect}|${settings.layout}|${settings.filter}|${settings.brightness}|${settings.contrast}|${settings.saturation}|${settings.mirror}|${settings.zoom}|${settings.zoomAmount}`;
         const target = clips.find((c) => c.thumbKey !== keyOf(c));
         if (!target) return;
         thumbBusyRef.current = true;
@@ -793,15 +973,7 @@ export default function HomeClient() {
                     cv.height = H;
                 }
                 const t = v.currentTime;
-                drawFrame(cv.getContext("2d"), v, W, H, {
-                    layout: s.layout,
-                    focusX: clip?.focusX ?? 0.5,
-                    bgCanvas: bg,
-                    caption: s.captions && clip ? captionAt(clip.captions, t) : null,
-                    captionStyle: s.captionStyle,
-                    captionPos: s.captionPos,
-                    captionSize: s.captionSize,
-                });
+                drawFrame(cv.getContext("2d"), v, W, H, buildFrameOpts(s, clip, t, bg));
                 if (clip && !v.paused && t >= clip.end) {
                     v.pause();
                     v.currentTime = clip.start;
@@ -812,6 +984,14 @@ export default function HomeClient() {
         raf = requestAnimationFrame(loop);
         return () => cancelAnimationFrame(raf);
     }, [videoUrl]);
+
+    // Preview speed + original-audio volume follow the settings
+    useEffect(() => {
+        const v = editorVideoRef.current;
+        if (!v) return;
+        v.playbackRate = Number(settings.speed) || 1;
+        v.volume = clamp(settings.originalVolume, 0, 1);
+    }, [settings.speed, settings.originalVolume, videoUrl, project]);
 
     // Jump the editor to a newly selected clip
     useEffect(() => {
@@ -1177,7 +1357,7 @@ export default function HomeClient() {
 
                             <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
                                 {/* ---------------- SETTINGS ---------------- */}
-                                <aside aria-label="Clip settings" className="h-fit space-y-6 rounded-[25px] border border-violet-100 bg-[#fcfaff] p-5 lg:sticky lg:top-24">
+                                <aside aria-label="Clip settings" className="h-fit space-y-6 rounded-[25px] border border-violet-100 bg-[#fcfaff] p-5 lg:sticky lg:top-24 lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto">
                                     <Field label="Clip length" icon={Clock}>
                                         <div className="flex flex-wrap gap-2">
                                             {CLIP_LENGTHS.map((l) => (
@@ -1311,6 +1491,10 @@ export default function HomeClient() {
                                         )}
                                     </div>
 
+                                    {/* NEW: look, motion, audio */}
+                                    <EffectsPanel settings={settings} setSetting={setSetting} filterSupported={filterSupported} />
+                                    <AudioPanel settings={settings} setSetting={setSetting} onPreviewMusic={toggleMusicPreview} musicPreviewing={musicPreviewing} />
+
                                     <div>
                                         <button
                                             onClick={generateClips}
@@ -1401,7 +1585,10 @@ export default function HomeClient() {
                                             className="offscreen-video"
                                             aria-hidden="true"
                                             onPlay={() => setPlaying(true)}
-                                            onPause={() => setPlaying(false)}
+                                            onPause={() => {
+                                                setPlaying(false);
+                                                if (recorderRef.current) finishRecording();
+                                            }}
                                             onTimeUpdate={(e) => setCurTime(e.currentTarget.currentTime)}
                                             onSeeked={(e) => setCurTime(e.currentTarget.currentTime)}
                                         />
@@ -1435,6 +1622,7 @@ export default function HomeClient() {
                                                             {fmtTime(clamp(curTime - selectedClip.start, 0, 1e9))}/{fmtTime(selectedClip.end - selectedClip.start)}
                                                         </span>
                                                     </div>
+                                                    <p className="mt-2 text-[11px] leading-4 text-slate-500">The preview plays the original sound. Music and voiceover are mixed in when you export.</p>
                                                 </div>
 
                                                 {/* controls */}
@@ -1483,6 +1671,10 @@ export default function HomeClient() {
                                                             </div>
                                                         ))}
                                                     </div>
+
+                                                    <button onClick={() => splitClip(selectedClip)} className="flex items-center gap-2 rounded-full border border-violet-200 bg-white px-4 py-2 text-xs font-bold text-violet-700 hover:bg-violet-50">
+                                                        <SplitSquareHorizontal size={14} /> Split clip at playhead
+                                                    </button>
 
                                                     {settings.layout === "crop" && sourceIsWider && (
                                                         <Field label={`Horizontal framing · ${Math.round((selectedClip.focusX ?? 0.5) * 100)}%`} icon={Crop} hint="Slide to keep the speaker in frame.">
@@ -1556,11 +1748,35 @@ export default function HomeClient() {
                                                         )}
                                                     </div>
 
+                                                    {/* NEW: overlays + voiceover */}
+                                                    <OverlayEditor
+                                                        clip={selectedClip}
+                                                        updateClip={updateClip}
+                                                        getPlayhead={() => editorVideoRef.current?.currentTime ?? curTime}
+                                                    />
+                                                    <VoiceoverCard
+                                                        clip={selectedClip}
+                                                        recording={recordingId === selectedClip.id}
+                                                        disabled={!!recordingId}
+                                                        onToggle={toggleRecording}
+                                                        onDelete={() => updateClip(selectedClip.id, { voice: undefined })}
+                                                    />
+
                                                     <ExportButton state={exportsState[selectedClip.id]} onExport={() => queueExport([selectedClip.id])} large />
                                                 </div>
                                             </div>
                                         )}
                                     </div>
+
+                                    {/* NEW: copyright-safe toolkit */}
+                                    <CopyrightKit
+                                        settings={settings}
+                                        setSetting={setSetting}
+                                        onSafePreset={applySafeAudioPreset}
+                                        onDownloadCredits={downloadCredits}
+                                        onCopyCredits={copyCredits}
+                                        onOutroAll={addOutroToAll}
+                                    />
 
                                     {/* clips grid */}
                                     {clips.length > 0 && (
@@ -1607,7 +1823,7 @@ export default function HomeClient() {
                                             {exporting && (
                                                 <div className="mb-4 flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900" role="status">
                                                     <Info size={16} className="mt-0.5 shrink-0" />
-                                                    Exporting renders in real time (a 30s clip takes ~30s). Keep this tab open and visible — browsers pause background tabs. Your browser may ask once to allow multiple downloads.
+                                                    Exporting renders in real time (a 30s clip takes ~30s at 1× speed). Keep this tab open and visible — browsers pause background tabs. Your browser may ask once to allow multiple downloads.
                                                 </div>
                                             )}
 
@@ -1657,7 +1873,7 @@ export default function HomeClient() {
                                                             </button>
                                                             <div className="p-3">
                                                                 <p className="line-clamp-2 min-h-[2.5rem] text-sm font-extrabold leading-5 text-[#171535]">{c.title}</p>
-                                                                <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
+                                                                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500">
                                                                     {c.captions ? (
                                                                         <span className="flex items-center gap-1 text-emerald-600"><CircleCheck size={12} /> Captions</span>
                                                                     ) : captionJob?.current === c.id ? (
@@ -1665,6 +1881,8 @@ export default function HomeClient() {
                                                                     ) : (
                                                                         <span>No captions</span>
                                                                     )}
+                                                                    {c.overlays?.length > 0 && <span className="flex items-center gap-1 text-violet-600"><Layers size={12} /> {c.overlays.length}</span>}
+                                                                    {c.voice && <span className="flex items-center gap-1 text-violet-600"><Mic size={12} /> Voice</span>}
                                                                 </div>
                                                                 <div className="mt-3 flex items-center gap-2">
                                                                     <ExportButton state={ex} onExport={() => queueExport([c.id])} />
@@ -1873,6 +2091,9 @@ export default function HomeClient() {
                                 { icon: Video, title: "Multiple Video Formats", desc: "Export 9:16, 4:5, 1:1 and 16:9 at 720p or 1080p." },
                                 { icon: Download, title: "Batch Downloads", desc: "Export every clip with one click — files download automatically as they finish." },
                                 { icon: Database, title: "Local Project Library", desc: "Projects and source videos are saved in your browser, so you can come back and keep editing." },
+                                { icon: Music, title: "Royalty-Free Music", desc: "Five original background tracks generated in your browser, with volume control and a one-click switch that mutes third-party audio." },
+                                { icon: Layers, title: "Text, Stickers & Effects", desc: "Animated text, emoji stickers, filters, speed, slow zoom, fades, progress bar and your own brand tag." },
+                                { icon: Mic, title: "Voiceover & Credits", desc: "Record narration over any clip, split clips at the playhead and download a credits file for your description." },
                             ].map((item) => {
                                 const Icon = item.icon;
                                 return (
