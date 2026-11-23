@@ -15,7 +15,7 @@ const jsonLd = {
       "@id": `${SITE.url}/#organization`,
       name: SITE.name,
       url: SITE.url,
-      logo: { "@type": "ImageObject", url: `${SITE.url}/icon` },
+      logo: { "@type": "ImageObject", url: `${SITE.url}/icon-512.png` },
       ...(sameAs.length ? { sameAs } : {}),
     },
     {

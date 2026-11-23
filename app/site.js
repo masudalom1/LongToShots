@@ -6,15 +6,20 @@ export const SITE = {
   name: "LongToShorts",
   domain: "longtoshorts.in",
   url: "https://longtoshorts.in",
-  tagline: "Free Long Video to Shorts & Reels Converter",
-  title: "LongToShorts – Free Long Video to Shorts, Reels & Clips Maker (No Watermark)",
+  tagline: "AI Long Video to Shorts Converter",
+  title: "AI Long Video to Shorts Converter – Free YouTube Shorts Generator | LongToShorts",
   description:
-    "Convert long videos into YouTube Shorts, Instagram Reels and short clips for free. AI highlight detection, auto captions, smart 9:16 crop, no watermark, unlimited clips. Runs in your browser — your video never leaves your device.",
+    "Convert one long video into multiple engaging YouTube Shorts using AI. Automatically identify highlights, add captions and resize to 9:16, then publish or schedule your Shorts. Free, no watermark, runs in your browser.",
   keywords: [
+    "ai long video to shorts converter",
+    "long video to youtube shorts",
+    "ai shorts generator",
+    "automatic youtube shorts creator",
+    "video to shorts converter",
+    "youtube shorts automation",
     "long video to shorts",
     "long to shorts",
     "longtoshorts",
-    "video to shorts converter",
     "long video to reels",
     "youtube video to shorts",
     "free shorts maker",
@@ -39,7 +44,7 @@ export const SITE = {
   // Fixed values (Cache Components can't prerender new Date()).
   // Update these whenever you publish changes.
   year: 2026,
-  lastModified: "2026-11-21",
+  lastModified: "2026-11-22",
 
   // Contact email used on the About, Privacy, Terms and Contact pages
   // e.g. "hello@longtoshorts.in"

@@ -2,6 +2,16 @@
 
 export const FAQS = [
   {
+    question: "What is an AI long video to Shorts converter?",
+    answer:
+      "It is a tool that turns one long video into multiple YouTube Shorts automatically. LongToShorts is a free AI Shorts generator and video to Shorts converter: it identifies the highlights, adds captions and resizes each clip to 9:16, so creating Shorts from a long video takes minutes instead of hours of manual editing.",
+  },
+  {
+    question: "Can I publish or schedule the Shorts directly to YouTube?",
+    answer:
+      "LongToShorts exports ready-to-post MP4 files. Upload them in YouTube Studio, where you can publish right away or set a schedule. This keeps your account private: we never ask for your YouTube login, and your YouTube Shorts automation stays under your control.",
+  },
+  {
     question: "How do I convert a long video into Shorts or Reels for free?",
     answer:
       "Upload your video to LongToShorts, choose a clip length (15–90 seconds) and press Generate clips. The AI scans the audio for the most energetic, speech-dense moments, crops them to 9:16, adds captions and lets you export clean MP4 files. It is completely free with no signup.",

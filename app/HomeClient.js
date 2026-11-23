@@ -95,6 +95,7 @@ import {
     dbAll,
 } from "./engine";
 import { SITE } from "./site";
+import { LANDING_PAGES } from "./_landing/pages";
 import { FAQS, USE_CASES } from "./content";
 import { EffectsPanel, AudioPanel, OverlayEditor, VoiceoverCard, CopyrightKit } from "./StudioExtras";
 
@@ -1114,15 +1115,15 @@ export default function HomeClient() {
                         <div className="relative z-10">
                             <p className="mb-5 inline-flex items-center gap-2 rounded-full border border-violet-100 bg-gradient-to-r from-orange-100 to-violet-100 px-4 py-2 text-sm font-bold text-[#24134c]">
                                 <Sparkles size={16} className="text-violet-700" />
-                                Free AI Shorts &amp; Reels Maker
+                                AI Long Video to Shorts Converter
                             </p>
 
                             <h1 id="hero-title" className="max-w-[750px] text-[38px] font-black leading-[1.08] tracking-[-1.5px] text-[#10102c] sm:text-5xl lg:text-[52px] xl:text-[58px]">
-                                Convert Long Videos into <span className="gradient-text relative inline-block">Shorts &amp; Reels</span> — Free
+                                Convert One Long Video into Multiple <span className="gradient-text relative inline-block">YouTube Shorts</span> with AI
                             </h1>
 
                             <p className="mt-6 max-w-[650px] text-lg font-medium leading-8 text-[#28264b] md:text-xl">
-                                <strong>{SITE.name}</strong> turns your long video into viral YouTube Shorts, Instagram Reels and short clips with AI highlight detection and auto captions — <span className="font-extrabold text-violet-700">completely free</span>, no watermark, unlimited clips, and nothing uploaded to a server.
+                                <strong>{SITE.name}</strong> is an AI Shorts generator that automatically identifies highlights, adds captions and resizes your long video into engaging YouTube Shorts and Reels, ready to publish or schedule — <span className="font-extrabold text-violet-700">completely free</span>, no watermark, unlimited clips, and nothing uploaded to a server.
                             </p>
 
                             {/* UPLOAD AREA */}
@@ -2233,6 +2234,15 @@ export default function HomeClient() {
                                     <a href="/contact" className="block hover:text-white">Contact</a>
                                     <a href="/privacy" className="block hover:text-white">Privacy Policy</a>
                                     <a href="/terms" className="block hover:text-white">Terms of Service</a>
+                                </div>
+                            </nav>
+
+                            <nav aria-label="Tools">
+                                <h3 className="mb-5 font-extrabold">Tools</h3>
+                                <div className="space-y-3 text-sm text-violet-200">
+                                    {LANDING_PAGES.map((p) => (
+                                        <a key={p.path} href={p.path} className="block hover:text-white">{p.label}</a>
+                                    ))}
                                 </div>
                             </nav>
 
